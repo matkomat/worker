@@ -2,7 +2,7 @@
 	"name" : "matkomat/worker",
 	"autoload" : {
 		"psr-4" : {
-			"Matkomat\\Worker\\" : "lib/"
+			"Matkomat\\Worker\\" : "lib/Worker"
 		}
 	}
 }
