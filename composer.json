@@ -1,8 +1,8 @@
 {
-	"name": "matkomat/worker",
+	"name" : "matkomat/worker",
 	"autoload" : {
-		"psr-0" : {
-			"Resque" : "lib"
+		"psr-4" : {
+			"Matkomat\\Worker\\" : "lib/"
 		}
 	}
 }
