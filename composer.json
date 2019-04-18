@@ -4,5 +4,9 @@
 		"psr-4" : {
 			"Matkomat\\Worker\\" : "src/Worker"
 		}
+	},
+	"require" : {
+		"resque/php-resque" : "^1.3.3"
 	}
+	
 }
