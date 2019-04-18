@@ -131,9 +131,9 @@ abstract class ResqueWorker implements Worker {
         }
     }
     
-    public function forceUpdateStatus($jobId) {
+    public function forceUpdateStatus() {
         $redis = Resque::redis();
-        $key = static::getStatusKey($jobId);
+        $key = static::getStatusKey($this->job->payload['id']);
         $redis->set($key, $this->getStatusJson());
         $redis->expire($key, static::$statusTtl);
         $this->statusLastUpdated = microtime(true);
