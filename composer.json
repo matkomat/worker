@@ -1,7 +1,8 @@
 {
-	"autoload": {
-		"psr-0": {
-			"Resque": "lib"
+	"name": "matkomat/worker",
+	"autoload" : {
+		"psr-0" : {
+			"Resque" : "lib"
 		}
 	}
 }
