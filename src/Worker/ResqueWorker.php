@@ -9,15 +9,16 @@ use Exception;
 class ResqueWorkerAbort extends Exception { }
 
 abstract class ResqueWorker implements Worker {
-    
+
+    const DEFAULT_STATUS_TTL = 3*24*60*60; //three days
+    const DEFAULT_DELAYED_STATUS_UPDATE_MICROSECONDS = 500000; //0.5 seconds
+
     const CONTROL_ABORT = 'abort';
     
-    const DEFAULT_STATUS_TTL = 3*24*60*60; //three days
-    
     /**
-     * resque job
+     * resque job set by php-resque
      *
-     * @var array
+     * @var \Resque_Job
      */
     public $job;
     
@@ -35,7 +36,9 @@ abstract class ResqueWorker implements Worker {
      * @var integer
      */
     protected static $statusTtl = self::DEFAULT_STATUS_TTL;
+    protected static $delayedStatusUpdateMicroseconds = self::DEFAULT_DELAYED_STATUS_UPDATE_MICROSECONDS; 
     
+    protected $statusLastUpdated = null;
     protected static $_onBeforeEnqueueInited = false;
     
     
@@ -58,22 +61,24 @@ abstract class ResqueWorker implements Worker {
             
             $this->status[StatusInfo::STATUS] = Status::STATUS_WORKING;
             $this->status[StatusInfo::TIME_STARTED] = microtime(true);
-            $this->forceUpdateStatus();
+            $this->updateStatus();
             
             $this->work();
             
             $this->status[StatusInfo::STATUS] = Status::STATUS_COMPLETED;
             $this->status[StatusInfo::TIME_ENDED] = microtime(true);
-            $this->forceUpdateStatus();
+            $this->status[StatusInfo::PROGRESS] = 1;
+            $this->updateStatus();
         } catch (ResqueWorkerAbort $e) {
             $this->status[StatusInfo::STATUS] = Status::STATUS_ABORTED;
             $this->status[StatusInfo::TIME_ENDED] = microtime(true);
-            $this->forceUpdateStatus();
+            $this->updateStatus();
             throw $e; //bubble it to resque handler
         } catch (\Throwable $e) {
             $this->status[StatusInfo::STATUS] = Status::STATUS_FAILED;
             $this->status[StatusInfo::TIME_ENDED] = microtime(true);
-            $this->forceUpdateStatus();
+            $this->status[StatusInfo::ERROR] = $e;
+            $this->updateStatus();
             throw $e; //bubble it to resque handler
         }
         
@@ -117,21 +122,20 @@ abstract class ResqueWorker implements Worker {
         $redis->expire($key, static::$statusTtl);
     }
     
-    
-    
     protected function getStatusJson() {
         return json_encode($this->status);
     }
     
-    protected $statusLastUpdated = null;
-    protected $statusSaveMinimumIntervalMicroseconds = 500000; //0.5 second default
-    public function updateStatus() {
-        if ((microtime(true) - $this->statusLastUpdated) > $this->statusSaveMinimumIntervalMicroseconds) {
-            $this->forceUpdateStatus();
+    public function delayedUpdateStatus($microseconds = null) {
+        if (is_null($microseconds)) {
+            $microseconds = static::$delayedStatusUpdateMicroseconds;
+        }
+        if ((microtime(true) - $this->statusLastUpdated) > $microseconds) {
+            $this->updateStatus();
         }
     }
     
-    public function forceUpdateStatus() {
+    public function updateStatus() {
         $redis = Resque::redis();
         $key = static::getStatusKey($this->job->payload['id']);
         $redis->set($key, $this->getStatusJson());
@@ -179,18 +183,88 @@ abstract class ResqueWorker implements Worker {
             throw new ResqueWorkerAbort();
         }
         
+        $this->updateProgressBasedOnPartStates(); 
+        
     }
     
-    protected function setProgress($progress) {
+    protected function setProgress($progress, $message=null, $delayed = false) {
         $this->tick();
         $this->status[StatusInfo::PROGRESS] = $progress;
-        $this->updateStatus();
+        if (!is_null($message)) {
+            $this->status[StatusInfo::MESSAGE] = $message;
+        }
+        if ($delayed) {
+            $this->updateStatus();
+        } else {
+            $this->delayedUpdateStatus();
+        }
     }
     
+    protected function setMessage($message, $delayed = false) {
+        $this->tick();
+        $this->status[StatusInfo::MESSAGE] = $message;
+        if ($delayed) {
+            $this->updateStatus();
+        } else {
+            $this->delayedUpdateStatus();
+        }
+    }
+
     
     public function init() {
         //feel free to override
     }
+    
+    
+    protected $totalParts = 1;
+    protected $currentPart = 1;
+    protected $currentPartProgress = 0;
+    protected $currentPartTimeExpected = 0;
+    protected $currentPartStarted = null;
+
+    public function setTotalParts($parts) {
+        $this->totalParts = $parts;
+    }
+    
+    public function nextProgressPart($message=null) {
+        $this->tick();
+        $this->currentPartProgress = 0;
+        if (!is_null($message)) {
+            $this->status[StatusInfo::MESSAGE] = $message;
+        }
+        $this->currentPart++;
+        $this->currentPartTimeExpected = 0;
+        $this->currentPartStarted = time();
+        $this->updateStatus();
+    }
+    
+    public function setPartIteration($iteration, $totalIterations) {
+        $this->tick();
+        $this->currentPartProgress = $iteration / $totalIterations;    
+    }
+    
+    public function setPartTimeExpected($seconds) {
+        $this->tick();
+        $this->currentPartTimeExpected = $seconds;
+        if (is_null($this->currentPartStarted)) {
+            $this->currentPartStarted = time();
+        }
+    }
+    
+    protected function updateProgressBasedOnPartStates() {
+        $onePartTotal = 1 / $this->totalParts;
+        $progress = ($this->currentPart - 1) / $this->totalParts;        
+        if ($this->currentPartProgress) {
+            $progress += $onePartTotal * $this->currentPartProgress;
+            $this->status[StatusInfo::PROGRESS] = $progress;
+            $this->delayedUpdateStatus();
+        } else if ($this->currentPartTimeExpected) {
+            $progress += $onePartTotal * ((time() - $this->currentPartStarted) / $this->currentPartTimeExpected);
+            $this->status[StatusInfo::PROGRESS] = $progress;
+            $this->delayedUpdateStatus();
+        }
+    }
+        
     
     
 }
