@@ -11,7 +11,7 @@ class ResqueWorkerAbort extends Exception { }
 abstract class ResqueWorker implements Worker {
 
     const DEFAULT_STATUS_TTL = 3*24*60*60; //three days
-    const DEFAULT_DELAYED_STATUS_UPDATE_MICROSECONDS = 500000; //0.5 seconds
+    const DEFAULT_DELAYED_STATUS_UPDATE_MILISECONDS = 500; //0.5 seconds
 
     const CONTROL_ABORT = 'abort';
     
@@ -36,16 +36,22 @@ abstract class ResqueWorker implements Worker {
      * @var integer
      */
     protected static $statusTtl = self::DEFAULT_STATUS_TTL;
-    protected static $delayedStatusUpdateMicroseconds = self::DEFAULT_DELAYED_STATUS_UPDATE_MICROSECONDS; 
+    protected static $delayedStatusUpdateMiliseconds = self::DEFAULT_DELAYED_STATUS_UPDATE_MILISECONDS; 
     
     protected $statusLastUpdated = null;
     protected static $_onBeforeEnqueueInited = false;
     
     
     protected function initStatus() {
-        $this->status = static::getStatusInfo($this->job->payload['id']);
+        $jobId = $this->job->payload['id'];
+        $this->status = static::getStatusInfo($jobId);
+        if (!$this->statusLastUpdated) {
+            $this->statusLastUpdated = 0;
+        }
         if (!is_array($this->status)) {
             $this->status = [];
+            $this->status[StatusInfo::JOB_ID] = $jobId;
+            $this->status[StatusInfo::JOB_CLASS] = get_class($this);
         }
     }
     
@@ -60,43 +66,81 @@ abstract class ResqueWorker implements Worker {
             $this->initStatus();
             
             $this->status[StatusInfo::STATUS] = Status::STATUS_WORKING;
-            $this->status[StatusInfo::TIME_STARTED] = microtime(true);
+            $this->status[StatusInfo::TIME_STARTED] = static::microtime();
             $this->updateStatus();
             
             $this->work();
             
             $this->status[StatusInfo::STATUS] = Status::STATUS_COMPLETED;
-            $this->status[StatusInfo::TIME_ENDED] = microtime(true);
+            $this->status[StatusInfo::TIME_ENDED] = static::microtime();
             $this->status[StatusInfo::PROGRESS] = 1;
+            static::clearExpectedSecondsStatusInfo($this->status);
             $this->updateStatus();
         } catch (ResqueWorkerAbort $e) {
             $this->status[StatusInfo::STATUS] = Status::STATUS_ABORTED;
-            $this->status[StatusInfo::TIME_ENDED] = microtime(true);
+            $this->status[StatusInfo::TIME_ENDED] = static::microtime();
+            static::clearExpectedSecondsStatusInfo($this->status);
             $this->updateStatus();
             throw $e; //bubble it to resque handler
         } catch (\Throwable $e) {
             $this->status[StatusInfo::STATUS] = Status::STATUS_FAILED;
-            $this->status[StatusInfo::TIME_ENDED] = microtime(true);
+            $this->status[StatusInfo::TIME_ENDED] = static::microtime();
             $this->status[StatusInfo::ERROR] = $e;
+            static::clearExpectedSecondsStatusInfo($this->status);
             $this->updateStatus();
             throw $e; //bubble it to resque handler
         }
         
     }
     
+    public static function microtime() {
+        $redis = Resque::redis();
+        $time = $redis->time();
+        return $time[0].'.'.$time[1];
+    }
+    
     public static function getStatusInfo($jobId) {
         $redis = Resque::redis();
+        
         $key = static::getStatusKey($jobId);
         $status = $redis->get($key);
-        return json_decode($status, true);
+        $status = json_decode($status, true);
+        
+        //see if job is marked as running/queued but resque doesn't have it as running/queued
+        if (in_array($status[StatusInfo::STATUS] ?? false, [Status::STATUS_WORKING, Status::STATUS_QUEUED])) {
+            $resqueJobStatus = null;
+            $rjs = new \Resque_Job_Status($jobId);
+            if ($rjs) {
+                $resqueJobStatus = $rjs->get();
+            }
+            if (($resqueJobStatus == \Resque_Job_Status::STATUS_FAILED) || empty($resqueJobStatus)) {
+                $status[StatusInfo::STATUS] = Status::STATUS_FAILED;
+                $redis->set($key, json_encode($status));
+                $redis->expire($key, static::$statusTtl);
+                //send abort just in case
+                static::abort($jobId);
+            }
+            
+        }
+        
+        //account the time-based progress
+        if (isset($status['_partExpected'])) {
+            //account for time
+            $status[StatusInfo::PROGRESS] += min([(static::microtime() - $status['_partStarted']) / $status['_partExpected'], 1]) * $status['_partWeight'];
+            //static::clearExpectedSecondsStatusInfo($status);
+        }
+        return $status;
     }
     
     public static function enqueue($queueName, $jobClass, $args=[]) {
         if (!static::$_onBeforeEnqueueInited) {
             $func = function($jobClass, $args, $queueName, $jobId) {
                 $status = [];
+                $status[StatusInfo::JOB_ID] = $jobId;
                 $status[StatusInfo::STATUS] = Status::STATUS_QUEUED;
-                $status[StatusInfo::TIME_QUEUED] = microtime(true);
+                $status[StatusInfo::TIME_QUEUED] = static::microtime();
+                $status[StatusInfo::PROGRESS] = 0;
+                $status[StatusInfo::JOB_CLASS] = $jobClass;
                 $redis = Resque::redis();
                 $key = static::getStatusKey($jobId);
                 $redis->set($key, json_encode($status));
@@ -126,11 +170,12 @@ abstract class ResqueWorker implements Worker {
         return json_encode($this->status);
     }
     
-    public function delayedUpdateStatus($microseconds = null) {
-        if (is_null($microseconds)) {
-            $microseconds = static::$delayedStatusUpdateMicroseconds;
+    public function delayedUpdateStatus($miliseconds = null) {
+        if (is_null($miliseconds)) {
+            $miliseconds = static::$delayedStatusUpdateMiliseconds;
         }
-        if ((microtime(true) - $this->statusLastUpdated) > $microseconds) {
+//d('delayed', $miliseconds, static::microtime() - $this->statusLastUpdated);
+        if (((static::microtime() - $this->statusLastUpdated)*1000) > $miliseconds) {
             $this->updateStatus();
         }
     }
@@ -140,7 +185,7 @@ abstract class ResqueWorker implements Worker {
         $key = static::getStatusKey($this->job->payload['id']);
         $redis->set($key, $this->getStatusJson());
         $redis->expire($key, static::$statusTtl);
-        $this->statusLastUpdated = microtime(true);
+        $this->statusLastUpdated = static::microtime();
     }
     
     protected static function getStatusKey($jobId, $subKey=null) {
@@ -183,8 +228,6 @@ abstract class ResqueWorker implements Worker {
             throw new ResqueWorkerAbort();
         }
         
-        $this->updateProgressBasedOnPartStates(); 
-        
     }
     
     protected function setProgress($progress, $message=null, $delayed = false) {
@@ -216,54 +259,72 @@ abstract class ResqueWorker implements Worker {
     }
     
     
-    protected $totalParts = 1;
-    protected $currentPart = 1;
-    protected $currentPartProgress = 0;
-    protected $currentPartTimeExpected = 0;
-    protected $currentPartStarted = null;
-
-    public function setTotalParts($parts) {
-        $this->totalParts = $parts;
+    protected $currentPartWeght = 1;
+    protected $currentPartStartProgress = 0;
+    public function setPartWeight($weight) {
+        $this->currentPartWeght = $weight;
     }
     
-    public function nextProgressPart($message=null) {
+    public function setExpectedSeconds($seconds, $partWeight=null) {
+        if (!is_null($partWeight)) {
+            $this->setPartWeight($partWeight);
+        }
+        $this->status['_partWeight'] = $this->currentPartWeght;
+        $this->status['_partStarted'] = static::microtime();
+        $this->status['_partExpected'] = $seconds;
+        $this->updateStatus();
+    }
+    
+    public function nextProgressPart($message=null, $partWeight = 0.5, $expectedSeconds = null) {
         $this->tick();
-        $this->currentPartProgress = 0;
         if (!is_null($message)) {
             $this->status[StatusInfo::MESSAGE] = $message;
         }
-        $this->currentPart++;
-        $this->currentPartTimeExpected = 0;
-        $this->currentPartStarted = time();
+
+        $this->setPartWeight($partWeight);
+        
+        
+        if (isset($this->status['_partWeight'])) {
+            //add previous part percentage to progress
+            if (!isset($this->status[StatusInfo::PROGRESS]) || !is_numeric($this->status[StatusInfo::PROGRESS])) {
+                $this->status[StatusInfo::PROGRESS] = 0;
+            }
+            $this->status[StatusInfo::PROGRESS] += $this->status['_partWeight'];
+            static::clearExpectedSecondsStatusInfo($this->status);
+        } 
+        
+        if (!is_null($expectedSeconds)) {
+            $this->setExpectedSeconds($expectedSeconds);
+        }
+        
+        $this->currentPartStartProgress = $this->status[StatusInfo::PROGRESS];
         $this->updateStatus();
+    }
+    
+    protected static function clearExpectedSecondsStatusInfo(&$status) {
+        unset($status['_partWeight']);
+        unset($status['_partStarted']);
+        unset($status['_partExpected']);
     }
     
     public function setPartIteration($iteration, $totalIterations) {
         $this->tick();
-        $this->currentPartProgress = $iteration / $totalIterations;    
-    }
-    
-    public function setPartTimeExpected($seconds) {
-        $this->tick();
-        $this->currentPartTimeExpected = $seconds;
-        if (is_null($this->currentPartStarted)) {
-            $this->currentPartStarted = time();
+        $partProgress = $iteration / $totalIterations;   
+        if ($partProgress > 1) {
+            $partProgress = 1;
         }
-    }
-    
-    protected function updateProgressBasedOnPartStates() {
-        $onePartTotal = 1 / $this->totalParts;
-        $progress = ($this->currentPart - 1) / $this->totalParts;        
-        if ($this->currentPartProgress) {
-            $progress += $onePartTotal * $this->currentPartProgress;
-            $this->status[StatusInfo::PROGRESS] = $progress;
-            $this->delayedUpdateStatus();
-        } else if ($this->currentPartTimeExpected) {
-            $progress += $onePartTotal * ((time() - $this->currentPartStarted) / $this->currentPartTimeExpected);
-            $this->status[StatusInfo::PROGRESS] = $progress;
+        $this->status[StatusInfo::PROGRESS] = $this->currentPartStartProgress + ($partProgress * $this->currentPartWeght);
+        
+        //by calling this method implementor wants to count iterations, so no need for expectedSeconds route
+        if (isset($this->status['_partWeight'])) {
+            static::clearExpectedSecondsStatusInfo($this->status);
+            $this->updateStatus();
+        } else {
             $this->delayedUpdateStatus();
         }
     }
+    
+    
         
     
     

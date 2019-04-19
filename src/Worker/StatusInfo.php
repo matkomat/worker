@@ -3,6 +3,8 @@
 namespace Matkomat\Worker;
 
 interface StatusInfo {
+    const JOB_ID = 'job_id';
+    const JOB_CLASS = 'job_class';
     const STATUS = 'status';
     const PROGRESS = 'progress';
     const MESSAGE = 'message';
