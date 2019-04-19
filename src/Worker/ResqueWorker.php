@@ -132,7 +132,7 @@ abstract class ResqueWorker implements Worker {
         return $status;
     }
     
-    public static function enqueue($queueName, $jobClass, $args=[]) {
+    public static function enqueue($jobClass, $args=[], $queueName) {
         if (!static::$_onBeforeEnqueueInited) {
             $func = function($jobClass, $args, $queueName, $jobId) {
                 $status = [];
@@ -141,6 +141,7 @@ abstract class ResqueWorker implements Worker {
                 $status[StatusInfo::TIME_QUEUED] = static::microtime();
                 $status[StatusInfo::PROGRESS] = 0;
                 $status[StatusInfo::JOB_CLASS] = $jobClass;
+                $status[StatusInfo::ARGS] = $args;
                 $redis = Resque::redis();
                 $key = static::getStatusKey($jobId);
                 $redis->set($key, json_encode($status));
@@ -275,6 +276,21 @@ abstract class ResqueWorker implements Worker {
         $this->updateStatus();
     }
     
+    public function initialProgressPart($message=null, $partWeight = 0.5, $expectedSeconds = null) {
+        $this->tick();
+        if (!is_null($message)) {
+            $this->status[StatusInfo::MESSAGE] = $message;
+        }
+        
+        $this->setPartWeight($partWeight);
+        if (!is_null($expectedSeconds)) {
+            $this->setExpectedSeconds($expectedSeconds);
+        }
+        
+        $this->currentPartStartProgress = 0;
+        $this->updateStatus();
+        
+    }
     public function nextProgressPart($message=null, $partWeight = 0.5, $expectedSeconds = null) {
         $this->tick();
         if (!is_null($message)) {

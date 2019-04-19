@@ -9,6 +9,7 @@ interface StatusInfo {
     const PROGRESS = 'progress';
     const MESSAGE = 'message';
     const ERROR = 'error';
+    const ARGS = 'args';
     
     const TIME_QUEUED = 'time_queued';
     const TIME_STARTED = 'time_started';
