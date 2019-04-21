@@ -76,6 +76,7 @@ abstract class ResqueWorker implements Worker {
             $this->status[StatusInfo::PROGRESS] = 1;
             static::clearExpectedSecondsStatusInfo($this->status);
             $this->updateStatus();
+            $this->onComplete();
         } catch (ResqueWorkerAbort $e) {
             $this->status[StatusInfo::STATUS] = Status::STATUS_ABORTED;
             $this->status[StatusInfo::TIME_ENDED] = static::microtime();
@@ -338,6 +339,11 @@ abstract class ResqueWorker implements Worker {
         } else {
             $this->delayedUpdateStatus();
         }
+    }
+    
+    
+    protected function onComplete() {
+        //feel free to override
     }
     
     
